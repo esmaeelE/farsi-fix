@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+farsi-fix — Fix mixed Persian/English bidirectional text.
+
+Uses Unicode LRI/PDI to wrap English/LTR tokens so they render
+correctly inside RTL context.
+
+Protected content: URLs, Markdown inline code, emails, parenthesized English.
+
+Examples:
+  farsi-fix document.md
+  farsi-fix document.md -o fixed.md
+  farsi-fix -i document.md
+  farsi-fix -i --backup document.md
+  farsi-fix -i *.md
+  cat document.md | farsi-fix
+  farsi-fix --check document.md
+"""
+
+import argparse
+import re
+import shutil
+import sys
+from pathlib import Path
+
+
+# ============================================================================
+# Unicode Bidirectional Characters
+# ============================================================================
+
+LRI = "\u2066"
+PDI = "\u2069"
+
+_PLACEHOLDER_START = "\ue000"
+_PLACEHOLDER_END = "\ue001"
+
+
+def _make_placeholder(index: int) -> str:
+    return _PLACEHOLDER_START + str(index) + _PLACEHOLDER_END
+
+
+# ============================================================================
+# Regular Expressions
+# ============================================================================
+
+BIDI_CONTROLS = re.compile(
+    r"[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]"
+)
+
+# URLs — lookbehind strips trailing sentence punctuation (.,;:!?).
+URL_PATTERN = re.compile(
+    r"""https?://[^\s<>()]+(?<=[A-Za-z0-9/\-])""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+MARKDOWN_CODE_PATTERN = re.compile(r"`[^`\n]+`")
+
+EMAIL_PATTERN = re.compile(
+    r"""[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}""",
+    re.VERBOSE,
+)
+
+PARENTHESIS_PATTERN = re.compile(
+    r"""\([^()\n]*[A-Za-z][^()\n]*\)""",
+    re.VERBOSE,
+)
+
+LTR_PATTERN = re.compile(
+    r"""
+    (?:
+        \.[A-Za-z]
+        |
+        [A-Za-z]
+    )
+    [A-Za-z0-9_.:+/#@%$&=~\-]*
+    """,
+    re.VERBOSE,
+)
+
+
+# ============================================================================
+# Bidi Processing
+# ============================================================================
+
+
+def remove_bidi_controls(text: str) -> str:
+    return BIDI_CONTROLS.sub("", text)
+
+
+def protect_regions(text: str) -> tuple[str, list[tuple[str, str]]]:
+    protected: list[tuple[str, str]] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        original = match.group(0)
+        placeholder = _make_placeholder(len(protected))
+        protected.append((placeholder, original))
+        return placeholder
+
+    for pattern in (URL_PATTERN, MARKDOWN_CODE_PATTERN, EMAIL_PATTERN, PARENTHESIS_PATTERN):
+        text = pattern.sub(_replace, text)
+
+    return text, protected
+
+
+def restore_regions(text: str, protected: list[tuple[str, str]]) -> str:
+    for placeholder, original in protected:
+        if PARENTHESIS_PATTERN.fullmatch(original):
+            replacement = LRI + original + PDI
+        else:
+            replacement = original
+        text = text.replace(placeholder, replacement)
+    return text
+
+
+def isolate_ltr(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        return LRI + match.group(0) + PDI
+
+    return LTR_PATTERN.sub(_replace, text)
+
+
+def fix_bidi(text: str) -> str:
+    text = remove_bidi_controls(text)
+    text, protected = protect_regions(text)
+    text = isolate_ltr(text)
+    text = restore_regions(text, protected)
+    return text
+
+
+# ============================================================================
+# File Operations
+# ============================================================================
+
+
+def read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"farsi-fix: file not found: {path}", file=sys.stderr)
+    except PermissionError:
+        print(f"farsi-fix: permission denied: {path}", file=sys.stderr)
+    except UnicodeDecodeError:
+        print(f"farsi-fix: file is not valid UTF-8: {path}", file=sys.stderr)
+    except OSError as exc:
+        print(f"farsi-fix: cannot read {path}: {exc}", file=sys.stderr)
+    return None
+
+
+def write_text_file(path: Path, text: str) -> bool:
+    try:
+        path.write_text(text, encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"farsi-fix: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+
+
+def process_file(
+    input_path: Path,
+    output_path: Path | None = None,
+    in_place: bool = False,
+    backup: bool = False,
+) -> bool:
+    text = read_text_file(input_path)
+    if text is None:
+        return False
+
+    result = fix_bidi(text)
+
+    if not in_place and output_path is None:
+        sys.stdout.write(result)
+        return True
+
+    if in_place:
+        if result == text:
+            return True
+        if backup:
+            backup_path = input_path.with_suffix(input_path.suffix + ".bak")
+            if backup_path.exists():
+                print(f"farsi-fix: backup already exists: {backup_path}", file=sys.stderr)
+                return False
+            try:
+                shutil.copy2(input_path, backup_path)
+            except OSError as exc:
+                print(f"farsi-fix: cannot create backup {backup_path}: {exc}", file=sys.stderr)
+                return False
+        return write_text_file(input_path, result)
+
+    if output_path is not None:
+        return write_text_file(output_path, result)
+
+    return True
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="farsi-fix",
+        description="Fix Persian/English bidirectional text using Unicode LTR isolation.",
+    )
+
+    parser.add_argument("files", nargs="*", type=Path, help="Input files. Omit for stdin.")
+    parser.add_argument("-o", "--output", type=Path, metavar="FILE", help="Write output to FILE.")
+    parser.add_argument("-i", "--in-place", action="store_true", help="Modify files in place.")
+    parser.add_argument("--backup", action="store_true", help="Create .bak before modifying.")
+    parser.add_argument("--check", action="store_true", help="Check whether changes are needed (exit 1 if so).")
+
+    args = parser.parse_args()
+
+    if args.in_place and not args.files:
+        parser.error("--in-place requires at least one input file")
+    if args.output and len(args.files) > 1:
+        parser.error("--output cannot be used with multiple input files")
+    if args.check and args.in_place:
+        parser.error("--check cannot be combined with --in-place")
+    if args.check and args.output:
+        parser.error("--check cannot be combined with --output")
+    if len(args.files) > 1 and not args.in_place and not args.output:
+        parser.error("multiple files require --in-place or --output")
+
+    # STDIN mode
+    if not args.files:
+        text = sys.stdin.read()
+        result = fix_bidi(text)
+        if args.check:
+            return 1 if result != text else 0
+        if args.output:
+            return 0 if write_text_file(args.output, result) else 1
+        sys.stdout.write(result)
+        return 0
+
+    # Check mode — report all files
+    if args.check:
+        needs_fix = []
+        for path in args.files:
+            text = read_text_file(path)
+            if text is None:
+                return 2
+            if fix_bidi(text) != text:
+                needs_fix.append(path)
+        for path in needs_fix:
+            print(path)
+        return 1 if needs_fix else 0
+
+    # Process files
+    success = True
+    for path in args.files:
+        if not process_file(path, args.output, args.in_place, args.backup):
+            success = False
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
